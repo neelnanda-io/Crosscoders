@@ -1,13 +1,17 @@
 # %%
 import os
+
 os.environ["TRANSFORMERS_CACHE"] = "/workspace/cache/"
 os.environ["DATASETS_CACHE"] = "/workspace/cache/"
 # %%
 from neel.imports import *
 from neel_plotly import *
 import wandb
+
 # %%
 import argparse
+
+
 def arg_parse_update_cfg(default_cfg):
     """
     Helper function to take in a dictionary of arguments, convert these to command line arguments, look at what was passed in, and return an updated dictionary.
@@ -36,41 +40,47 @@ def arg_parse_update_cfg(default_cfg):
     print("Updated config")
     print(json.dumps(cfg, indent=2))
     return cfg
+
+
 default_cfg = {
     "seed": 49,
-    "batch_size": 4096,
+    "batch_size": 512,
     "buffer_mult": 384,
-    "lr": 1e-4,
-    "num_tokens": int(2e9),
-    "l1_coeff": 3e-4,
+    "lr": 5e-5,
+    "num_tokens": int(1e9),
+    "l1_coeff": 5,
     "beta1": 0.9,
-    "beta2": 0.99,
-    "dict_mult": 32,
-    "seq_len": 128,
-    "enc_dtype":"fp32",
-    "remove_rare_dir": False,
-    "model_name": "gelu-2l",
-    "site": "mlp_out",
-    "layer": 0,
-    "device": "cuda:0"
+    "beta2": 0.999,
+    "dict_size": 2**14,
+    "seq_len": 1024,
+    "enc_dtype": "fp32",
+    # "remove_rare_dir": False,
+    "model_name": "gpt2-small",
+    "site": "resid_post",
+    # "layer": 0,
+    "device": "cuda:0",
 }
-site_to_size = {
-    "mlp_out": 512,
-    "post": 2048,
-    "resid_pre": 512,
-    "resid_mid": 512,
-    "resid_post": 512,
-}
+# site_to_size = {
+#     "mlp_out": 512,
+#     "post": 2048,
+#     "resid_pre": 512,
+#     "resid_mid": 512,
+#     "resid_post": 512,
+# }
 
 cfg = arg_parse_update_cfg(default_cfg)
+
+
 def post_init_cfg(cfg):
     cfg["model_batch_size"] = cfg["batch_size"] // cfg["seq_len"] * 16
     cfg["buffer_size"] = cfg["batch_size"] * cfg["buffer_mult"]
     cfg["buffer_batches"] = cfg["buffer_size"] // cfg["seq_len"]
-    cfg["act_name"] = utils.get_act_name(cfg["site"], cfg["layer"])
-    cfg["act_size"] = site_to_size[cfg["site"]]
-    cfg["dict_size"] = cfg["act_size"] * cfg["dict_mult"]
-    cfg["name"] = f"{cfg['model_name']}_{cfg['layer']}_{cfg['dict_size']}_{cfg['site']}"
+    # cfg["act_name"] = utils.get_act_name(cfg["site"], cfg["layer"])
+    # cfg["act_size"] = site_to_size[cfg["site"]]
+    # cfg["dict_size"] = cfg["act_size"] * cfg["dict_mult"]
+    cfg["name"] = f"{cfg['model_name']}_{cfg['dict_size']}_{cfg['site']}"
+
+
 post_init_cfg(cfg)
 pprint.pprint(cfg)
 # %%
@@ -82,7 +92,11 @@ np.random.seed(SEED)
 random.seed(SEED)
 torch.set_grad_enabled(True)
 
-model = HookedTransformer.from_pretrained(cfg["model_name"]).to(DTYPES[cfg["enc_dtype"]]).to(cfg["device"])
+model = (
+    HookedTransformer.from_pretrained(cfg["model_name"])
+    .to(DTYPES[cfg["enc_dtype"]])
+    .to(cfg["device"])
+)
 
 n_layers = model.cfg.n_layers
 d_model = model.cfg.d_model
@@ -90,28 +104,53 @@ n_heads = model.cfg.n_heads
 d_head = model.cfg.d_head
 d_mlp = model.cfg.d_mlp
 d_vocab = model.cfg.d_vocab
+
+
 # %%
-@torch.no_grad()
-def get_acts(tokens, batch_size=1024):
-    _, cache = model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1, names_filter=cfg["act_name"])
-    acts = cache[cfg["act_name"]]
-    acts = acts.reshape(-1, acts.shape[-1])
-    subsample = torch.randperm(acts.shape[0], generator=GENERATOR)[:batch_size]
-    subsampled_acts = acts[subsample, :]
-    return subsampled_acts, acts
+# @torch.no_grad()
+# def get_acts(tokens, batch_size=1024):
+#     _, cache = model.run_with_cache(
+#         tokens, stop_at_layer=cfg["layer"] + 1, names_filter=cfg["act_name"]
+#     )
+#     acts = cache[cfg["act_name"]]
+#     acts = acts.reshape(-1, acts.shape[-1])
+#     subsample = torch.randperm(acts.shape[0], generator=GENERATOR)[:batch_size]
+#     subsampled_acts = acts[subsample, :]
+#     return subsampled_acts, acts
+
+
 # sub, acts = get_acts(torch.arange(20).reshape(2, 10), batch_size=3)
 # sub.shape, acts.shape
 # %%
 SAVE_DIR = Path("/workspace/1L-Sparse-Autoencoder/checkpoints")
+
+
 class AutoEncoder(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, model):
         super().__init__()
         d_hidden = cfg["dict_size"]
         l1_coeff = cfg["l1_coeff"]
         dtype = DTYPES[cfg["enc_dtype"]]
         torch.manual_seed(cfg["seed"])
-        self.W_enc = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg["act_size"], d_hidden, dtype=dtype)))
-        self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg["act_size"], dtype=dtype)))
+        self.W_enc = nn.Parameter(
+            torch.empty(model.cfg.n_layers, model.cfg.d_model, d_hidden, dtype=dtype)
+        )
+        self.W_dec = nn.Parameter(
+            torch.nn.init.normal_(
+                torch.empty(
+                    model.cfg.n_layers, d_hidden, model.cfg.d_model, dtype=dtype
+                )
+            )
+        )
+        # Make norm of W_dec 0.1 for each column, separate per layer
+        self.W_dec.data = (
+            self.W_dec.data / self.W_dec.data.norm(dim=-1, keepdim=True) * 0.1
+        )
+        # Initialise W_enc to be the transpose of W_dec
+        self.W_enc.data = einops.rearrange(
+            self.W_dec.data.clone(),
+            "n_layers d_hidden d_model -> n_layers d_model d_hidden",
+        )
         self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=dtype))
         self.b_dec = nn.Parameter(torch.zeros(cfg["act_size"], dtype=dtype))
 
@@ -121,69 +160,75 @@ class AutoEncoder(nn.Module):
         self.l1_coeff = l1_coeff
 
         self.to(cfg["device"])
-    
+
     def forward(self, x):
-        x_cent = x - self.b_dec
-        acts = F.relu(x_cent @ self.W_enc + self.b_enc)
+        # x_cent = x - self.b_dec
+        acts = F.relu(x @ self.W_enc + self.b_enc)
         x_reconstruct = acts @ self.W_dec + self.b_dec
         l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
         l1_loss = self.l1_coeff * (acts.float().abs().sum())
         loss = l2_loss + l1_loss
         return loss, x_reconstruct, acts, l2_loss, l1_loss
-    
+
     @torch.no_grad()
     def make_decoder_weights_and_grad_unit_norm(self):
         W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
-        W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
+        W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(
+            -1, keepdim=True
+        ) * W_dec_normed
         self.W_dec.grad -= W_dec_grad_proj
         # Bugfix(?) for ensuring W_dec retains unit norm, this was not there when I trained my original autoencoders.
         self.W_dec.data = W_dec_normed
-    
+
     def get_version(self):
-        version_list = [int(file.name.split(".")[0]) for file in list(SAVE_DIR.iterdir()) if "pt" in str(file)]
+        version_list = [
+            int(file.name.split(".")[0])
+            for file in list(SAVE_DIR.iterdir())
+            if "pt" in str(file)
+        ]
         if len(version_list):
-            return 1+max(version_list)
+            return 1 + max(version_list)
         else:
             return 0
 
     def save(self):
         version = self.get_version()
-        torch.save(self.state_dict(), SAVE_DIR/(str(version)+".pt"))
-        with open(SAVE_DIR/(str(version)+"_cfg.json"), "w") as f:
+        torch.save(self.state_dict(), SAVE_DIR / (str(version) + ".pt"))
+        with open(SAVE_DIR / (str(version) + "_cfg.json"), "w") as f:
             json.dump(cfg, f)
         print("Saved as version", version)
-    
+
     @classmethod
     def load(cls, version):
-        cfg = (json.load(open(SAVE_DIR/(str(version)+"_cfg.json"), "r")))
+        cfg = json.load(open(SAVE_DIR / (str(version) + "_cfg.json"), "r"))
         pprint.pprint(cfg)
         self = cls(cfg=cfg)
-        self.load_state_dict(torch.load(SAVE_DIR/(str(version)+".pt")))
+        self.load_state_dict(torch.load(SAVE_DIR / (str(version) + ".pt")))
         return self
 
-    @classmethod
-    def load_from_hf(cls, version):
-        """
-        Loads the saved autoencoder from HuggingFace. 
-        
-        Version is expected to be an int, or "run1" or "run2"
+    # @classmethod
+    # def load_from_hf(cls, version):
+    #     """
+    #     Loads the saved autoencoder from HuggingFace.
 
-        version 25 is the final checkpoint of the first autoencoder run,
-        version 47 is the final checkpoint of the second autoencoder run.
-        """
-        if version=="run1":
-            version = 25
-        elif version=="run2":
-            version = 47
-        
-        cfg = utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}_cfg.json")
-        pprint.pprint(cfg)
-        self = cls(cfg=cfg)
-        self.load_state_dict(utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True))
-        return self
+    #     Version is expected to be an int, or "run1" or "run2"
+
+    #     version 25 is the final checkpoint of the first autoencoder run,
+    #     version 47 is the final checkpoint of the second autoencoder run.
+    #     """
+    #     if version=="run1":
+    #         version = 25
+    #     elif version=="run2":
+    #         version = 47
+
+    #     cfg = utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}_cfg.json")
+    #     pprint.pprint(cfg)
+    #     self = cls(cfg=cfg)
+    #     self.load_state_dict(utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True))
+    #     return self
+
 
 # %%
-
 
 
 # %%
@@ -191,36 +236,51 @@ def shuffle_data(all_tokens):
     print("Shuffled data")
     return all_tokens[torch.randperm(all_tokens.shape[0])]
 
+
 loading_data_first_time = False
 if loading_data_first_time:
-    data = load_dataset("NeelNanda/c4-code-tokenized-2b", split="train", cache_dir="/workspace/cache/")
+    raise NotImplementedError("This is not implemented yet")
+    data = load_dataset(
+        "NeelNanda/c4-code-tokenized-2b", split="train", cache_dir="/workspace/cache/"
+    )
     data.save_to_disk("/workspace/data/c4_code_tokenized_2b.hf")
     data.set_format(type="torch", columns=["tokens"])
     all_tokens = data["tokens"]
     all_tokens.shape
 
-
-    all_tokens_reshaped = einops.rearrange(all_tokens, "batch (x seq_len) -> (batch x) seq_len", x=8, seq_len=128)
+    all_tokens_reshaped = einops.rearrange(
+        all_tokens, "batch (x seq_len) -> (batch x) seq_len", x=8, seq_len=128
+    )
     all_tokens_reshaped[:, 0] = model.tokenizer.bos_token_id
-    all_tokens_reshaped = all_tokens_reshaped[torch.randperm(all_tokens_reshaped.shape[0])]
+    all_tokens_reshaped = all_tokens_reshaped[
+        torch.randperm(all_tokens_reshaped.shape[0])
+    ]
     torch.save(all_tokens_reshaped, "/workspace/data/c4_code_2b_tokens_reshaped.pt")
 else:
     # data = datasets.load_from_disk("/workspace/data/c4_code_tokenized_2b.hf")
-    all_tokens = torch.load("/workspace/data/c4_code_2b_tokens_reshaped.pt")
+    all_tokens = torch.load("/workspace/data/owt.pt")
+    all_tokens = all_tokens[: 2**20]
     all_tokens = shuffle_data(all_tokens)
 
+
 # %%
-class Buffer():
+class Buffer:
     """
-    This defines a data buffer, to store a bunch of MLP acts that can be used to train the autoencoder. It'll automatically run the model to generate more when it gets halfway empty. 
+    This defines a data buffer, to store a stack of acts across all layers that can be used to train the autoencoder. It'll automatically run the model to generate more when it gets halfway empty.
     """
-    def __init__(self, cfg):
-        self.buffer = torch.zeros((cfg["buffer_size"], cfg["act_size"]), dtype=torch.bfloat16, requires_grad=False).to(cfg["device"])
+
+    def __init__(self, cfg, model):
+        self.buffer = torch.zeros(
+            (cfg["buffer_size"], model.cfg.n_layers, model.cfg.d_model),
+            dtype=torch.bfloat16,
+            requires_grad=False,
+        ).to(cfg["device"])
         self.cfg = cfg
+        self.model = model
         self.token_pointer = 0
         self.first = True
         self.refresh()
-    
+
     @torch.no_grad()
     def refresh(self):
         self.pointer = 0
@@ -228,100 +288,138 @@ class Buffer():
             if self.first:
                 num_batches = self.cfg["buffer_batches"]
             else:
-                num_batches = self.cfg["buffer_batches"]//2
+                num_batches = self.cfg["buffer_batches"] // 2
             self.first = False
             for _ in range(0, num_batches, self.cfg["model_batch_size"]):
-                tokens = all_tokens[self.token_pointer:self.token_pointer+self.cfg["model_batch_size"]]
-                _, cache = model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1, names_filter=cfg["act_name"])
-                acts = cache[cfg["act_name"]].reshape(-1, self.cfg["act_size"])
-                
+                tokens = all_tokens[
+                    self.token_pointer : min(
+                        self.token_pointer + self.cfg["model_batch_size"], num_batches
+                    )
+                ]
+                _, cache = self.model.run_with_cache(
+                    tokens, names_filter=lambda x: x.endswith("resid_post")
+                )
+                cache: ActivationCache
+
+                acts = cache.stack_activation("resid_post")
+                acts = einops.rearrange(
+                    acts,
+                    "n_layers batch seq_len d_model -> (batch seq_len) n_layers d_model",
+                )
+
                 # print(tokens.shape, acts.shape, self.pointer, self.token_pointer)
-                self.buffer[self.pointer: self.pointer+acts.shape[0]] = acts
+                self.buffer[self.pointer : self.pointer + acts.shape[0]] = acts
                 self.pointer += acts.shape[0]
                 self.token_pointer += self.cfg["model_batch_size"]
                 # if self.token_pointer > all_tokens.shape[0] - self.cfg["model_batch_size"]:
                 #     self.token_pointer = 0
 
         self.pointer = 0
-        self.buffer = self.buffer[torch.randperm(self.buffer.shape[0]).to(cfg["device"])]
+        self.buffer = self.buffer[
+            torch.randperm(self.buffer.shape[0]).to(self.cfg["device"])
+        ]
 
     @torch.no_grad()
     def next(self):
-        out = self.buffer[self.pointer:self.pointer+self.cfg["batch_size"]]
+        out = self.buffer[self.pointer : self.pointer + self.cfg["batch_size"]]
         self.pointer += self.cfg["batch_size"]
-        if self.pointer > self.buffer.shape[0]//2 - self.cfg["batch_size"]:
+        if self.pointer > self.buffer.shape[0] // 2 - self.cfg["batch_size"]:
             # print("Refreshing the buffer!")
             self.refresh()
         return out
 
+
 # buffer.refresh()
- # %%
+# %%
+
 
 # %%
 def replacement_hook(mlp_post, hook, encoder):
     mlp_post_reconstr = encoder(mlp_post)[1]
     return mlp_post_reconstr
 
+
 def mean_ablate_hook(mlp_post, hook):
     mlp_post[:] = mlp_post.mean([0, 1])
     return mlp_post
 
+
 def zero_ablate_hook(mlp_post, hook):
-    mlp_post[:] = 0.
+    mlp_post[:] = 0.0
     return mlp_post
 
-@torch.no_grad()
-def get_recons_loss(num_batches=5, local_encoder=None):
-    if local_encoder is None:
-        local_encoder = encoder
-    loss_list = []
-    for i in range(num_batches):
-        tokens = all_tokens[torch.randperm(len(all_tokens))[:cfg["model_batch_size"]]]
-        loss = model(tokens, return_type="loss")
-        recons_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], partial(replacement_hook, encoder=local_encoder))])
-        # mean_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], mean_ablate_hook)])
-        zero_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], zero_ablate_hook)])
-        loss_list.append((loss, recons_loss, zero_abl_loss))
-    losses = torch.tensor(loss_list)
-    loss, recons_loss, zero_abl_loss = losses.mean(0).tolist()
 
-    print(loss, recons_loss, zero_abl_loss)
-    score = ((zero_abl_loss - recons_loss)/(zero_abl_loss - loss))
-    print(f"{score:.2%}")
-    # print(f"{((zero_abl_loss - mean_abl_loss)/(zero_abl_loss - loss)).item():.2%}")
-    return score, loss, recons_loss, zero_abl_loss
+# Needs to be adapted to work with crosscoders, and is kinda cursed
+# @torch.no_grad()
+# def get_recons_loss(num_batches=5, local_encoder=None):
+#     if local_encoder is None:
+#         local_encoder = encoder
+#     loss_list = []
+#     for i in range(num_batches):
+#         tokens = all_tokens[torch.randperm(len(all_tokens))[: cfg["model_batch_size"]]]
+#         loss = model(tokens, return_type="loss")
+#         recons_loss = model.run_with_hooks(
+#             tokens,
+#             return_type="loss",
+#             fwd_hooks=[
+#                 (cfg["act_name"], partial(replacement_hook, encoder=local_encoder))
+#             ],
+#         )
+#         # mean_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], mean_ablate_hook)])
+#         zero_abl_loss = model.run_with_hooks(
+#             tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], zero_ablate_hook)]
+#         )
+#         loss_list.append((loss, recons_loss, zero_abl_loss))
+#     losses = torch.tensor(loss_list)
+#     loss, recons_loss, zero_abl_loss = losses.mean(0).tolist()
+
+#     print(loss, recons_loss, zero_abl_loss)
+#     score = (zero_abl_loss - recons_loss) / (zero_abl_loss - loss)
+#     print(f"{score:.2%}")
+#     # print(f"{((zero_abl_loss - mean_abl_loss)/(zero_abl_loss - loss)).item():.2%}")
+#     return score, loss, recons_loss, zero_abl_loss
+
+
 # print(get_recons_loss())
+
 
 # %%
 # Frequency
 @torch.no_grad()
 def get_freqs(num_batches=25, local_encoder=None):
+    raise NotImplementedError("This is not implemented yet")
     if local_encoder is None:
         local_encoder = encoder
-    act_freq_scores = torch.zeros(local_encoder.d_hidden, dtype=torch.float32).to(cfg["device"])
+    act_freq_scores = torch.zeros(local_encoder.d_hidden, dtype=torch.float32).to(
+        cfg["device"]
+    )
     total = 0
     for i in tqdm.trange(num_batches):
-        tokens = all_tokens[torch.randperm(len(all_tokens))[:cfg["model_batch_size"]]]
-        
-        _, cache = model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1, names_filter=cfg["act_name"])
+        tokens = all_tokens[torch.randperm(len(all_tokens))[: cfg["model_batch_size"]]]
+
+        _, cache = model.run_with_cache(
+            tokens, stop_at_layer=cfg["layer"] + 1, names_filter=cfg["act_name"]
+        )
         acts = cache[cfg["act_name"]]
         acts = acts.reshape(-1, cfg["act_size"])
 
         hidden = local_encoder(acts)[2]
-        
+
         act_freq_scores += (hidden > 0).sum(0)
-        total+=hidden.shape[0]
+        total += hidden.shape[0]
     act_freq_scores /= total
-    num_dead = (act_freq_scores==0).float().mean()
+    num_dead = (act_freq_scores == 0).float().mean()
     print("Num dead", num_dead)
     return act_freq_scores
+
+
 # %%
-@torch.no_grad()
-def re_init(indices, encoder):
-    new_W_enc = (torch.nn.init.kaiming_uniform_(torch.zeros_like(encoder.W_enc)))
-    new_W_dec = (torch.nn.init.kaiming_uniform_(torch.zeros_like(encoder.W_dec)))
-    new_b_enc = (torch.zeros_like(encoder.b_enc))
-    print(new_W_dec.shape, new_W_enc.shape, new_b_enc.shape)
-    encoder.W_enc.data[:, indices] = new_W_enc[:, indices]
-    encoder.W_dec.data[indices, :] = new_W_dec[indices, :]
-    encoder.b_enc.data[indices] = new_b_enc[indices]
+# @torch.no_grad()
+# def re_init(indices, encoder):
+#     new_W_enc = torch.nn.init.kaiming_uniform_(torch.zeros_like(encoder.W_enc))
+#     new_W_dec = torch.nn.init.kaiming_uniform_(torch.zeros_like(encoder.W_dec))
+#     new_b_enc = torch.zeros_like(encoder.b_enc)
+#     print(new_W_dec.shape, new_W_enc.shape, new_b_enc.shape)
+#     encoder.W_enc.data[:, indices] = new_W_enc[:, indices]
+#     encoder.W_dec.data[indices, :] = new_W_dec[indices, :]
+#     encoder.b_enc.data[indices] = new_b_enc[indices]
