@@ -7,7 +7,7 @@ os.environ["DATASETS_CACHE"] = "/workspace/cache/"
 from neel.imports import *
 from neel_plotly import *
 import wandb
-
+from torch.nn.utils import clip_grad_norm_
 # %%
 import argparse
 
@@ -44,10 +44,10 @@ def arg_parse_update_cfg(default_cfg):
 
 default_cfg = {
     "seed": 49,
-    "batch_size": 512,
-    "buffer_mult": 384,
+    "batch_size": 2048,
+    "buffer_mult": 512,
     "lr": 5e-5,
-    "num_tokens": int(1e9),
+    "num_tokens": 2**30,
     "l1_coeff": 5,
     "beta1": 0.9,
     "beta2": 0.999,
@@ -59,7 +59,12 @@ default_cfg = {
     "site": "resid_post",
     # "layer": 0,
     "device": "cuda:0",
+    "model_batch_size": 32,
+    "log_every": 30,
+    "save_every": 30000,
+    "dec_init_norm": 0.005,
 }
+
 # site_to_size = {
 #     "mlp_out": 512,
 #     "post": 2048,
@@ -72,7 +77,6 @@ cfg = arg_parse_update_cfg(default_cfg)
 
 
 def post_init_cfg(cfg):
-    cfg["model_batch_size"] = cfg["batch_size"] // cfg["seq_len"] * 16
     cfg["buffer_size"] = cfg["batch_size"] * cfg["buffer_mult"]
     cfg["buffer_batches"] = cfg["buffer_size"] // cfg["seq_len"]
     # cfg["act_name"] = utils.get_act_name(cfg["site"], cfg["layer"])
@@ -92,7 +96,7 @@ np.random.seed(SEED)
 random.seed(SEED)
 torch.set_grad_enabled(True)
 
-model = (
+model: HookedTransformer = (
     HookedTransformer.from_pretrained(cfg["model_name"])
     .to(DTYPES[cfg["enc_dtype"]])
     .to(cfg["device"])
@@ -122,88 +126,160 @@ d_vocab = model.cfg.d_vocab
 # sub, acts = get_acts(torch.arange(20).reshape(2, 10), batch_size=3)
 # sub.shape, acts.shape
 # %%
-SAVE_DIR = Path("/workspace/1L-Sparse-Autoencoder/checkpoints")
+SAVE_DIR = Path("/workspace/SAE-Alternatives-2/checkpoints")
 
+from typing import NamedTuple
 
-class AutoEncoder(nn.Module):
+class LossOutput(NamedTuple):
+    # loss: torch.Tensor
+    l2_loss: torch.Tensor
+    l1_loss: torch.Tensor
+    l0_loss: torch.Tensor
+
+class CrossCoder(nn.Module):
     def __init__(self, cfg, model):
         super().__init__()
-        d_hidden = cfg["dict_size"]
-        l1_coeff = cfg["l1_coeff"]
-        dtype = DTYPES[cfg["enc_dtype"]]
-        torch.manual_seed(cfg["seed"])
+        self.cfg = cfg
+        d_hidden = self.cfg["dict_size"]
+        # l1_coeff = self.cfg["l1_coeff"]
+        self.dtype = DTYPES[self.cfg["enc_dtype"]]
+        torch.manual_seed(self.cfg["seed"])
         self.W_enc = nn.Parameter(
-            torch.empty(model.cfg.n_layers, model.cfg.d_model, d_hidden, dtype=dtype)
+            torch.empty(model.cfg.n_layers, model.cfg.d_model, d_hidden, dtype=self.dtype)
         )
         self.W_dec = nn.Parameter(
             torch.nn.init.normal_(
                 torch.empty(
-                    model.cfg.n_layers, d_hidden, model.cfg.d_model, dtype=dtype
+                    d_hidden, model.cfg.n_layers, model.cfg.d_model, dtype=self.dtype
                 )
             )
         )
         # Make norm of W_dec 0.1 for each column, separate per layer
         self.W_dec.data = (
-            self.W_dec.data / self.W_dec.data.norm(dim=-1, keepdim=True) * 0.1
+            self.W_dec.data / self.W_dec.data.norm(dim=-1, keepdim=True) * self.cfg["dec_init_norm"]
         )
         # Initialise W_enc to be the transpose of W_dec
         self.W_enc.data = einops.rearrange(
             self.W_dec.data.clone(),
-            "n_layers d_hidden d_model -> n_layers d_model d_hidden",
+            "d_hidden n_layers d_model -> n_layers d_model d_hidden",
         )
-        self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=dtype))
-        self.b_dec = nn.Parameter(torch.zeros(cfg["act_size"], dtype=dtype))
+        self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=self.dtype))
+        self.b_dec = nn.Parameter(
+            torch.zeros((model.cfg.n_layers, model.cfg.d_model), dtype=self.dtype)
+        )
 
-        self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
+        # self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
 
         self.d_hidden = d_hidden
-        self.l1_coeff = l1_coeff
+        # self.l1_coeff = l1_coeff
 
-        self.to(cfg["device"])
+        self.to(self.cfg["device"])
+
+        self.save_dir = None
+        self.save_version = 0
+
+    def encode(self, x, apply_relu=True):
+        # x: [batch, n_layers, d_model]
+        x_enc = einops.einsum(
+            x,
+            self.W_enc,
+            "batch n_layers d_model, n_layers d_model d_hidden -> batch d_hidden",
+        )
+        if apply_relu:
+            acts = F.relu(x_enc + self.b_enc)
+        else:
+            acts = x_enc + self.b_enc
+        return acts
+
+    def decode(self, acts):
+        # acts: [batch, d_hidden]
+        acts_dec = einops.einsum(
+            acts,
+            self.W_dec,
+            "batch d_hidden, d_hidden n_layers d_model -> batch n_layers d_model",
+        )
+        return acts_dec + self.b_dec
 
     def forward(self, x):
-        # x_cent = x - self.b_dec
-        acts = F.relu(x @ self.W_enc + self.b_enc)
-        x_reconstruct = acts @ self.W_dec + self.b_dec
-        l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-        l1_loss = self.l1_coeff * (acts.float().abs().sum())
-        loss = l2_loss + l1_loss
-        return loss, x_reconstruct, acts, l2_loss, l1_loss
+        # x: [batch, n_layers, d_model]
+        acts = self.encode(x)
+        return self.decode(acts)
 
-    @torch.no_grad()
-    def make_decoder_weights_and_grad_unit_norm(self):
-        W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
-        W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(
-            -1, keepdim=True
-        ) * W_dec_normed
-        self.W_dec.grad -= W_dec_grad_proj
-        # Bugfix(?) for ensuring W_dec retains unit norm, this was not there when I trained my original autoencoders.
-        self.W_dec.data = W_dec_normed
+    def get_losses(self, x):
+        # x: [batch, n_layers, d_model]
+        x = x.to(self.dtype)
+        acts = self.encode(x)
+        # acts: [batch, d_hidden]
+        x_reconstruct = self.decode(acts)
+        diff = x_reconstruct.float() - x.float()
+        squared_diff = diff.pow(2)
+        l2_per_batch = einops.reduce(squared_diff, 'batch n_layers d_model -> batch', 'sum')
+        l2_loss = l2_per_batch.mean()
 
-    def get_version(self):
+        decoder_norms = self.W_dec.norm(dim=-1)
+        # decoder_norms: [d_hidden, n_layers]
+        total_decoder_norm = einops.reduce(decoder_norms, 'd_hidden n_layers -> d_hidden', 'sum')
+        l1_loss = (acts * total_decoder_norm[None, :]).sum(-1).mean(0)
+
+        # overall_loss = l2_loss + self.l1_coeff *  l1_loss
+
+        l0_loss = (acts>0).float().sum(-1).mean()
+
+        return LossOutput(l2_loss=l2_loss, l1_loss=l1_loss, l0_loss=l0_loss)
+
+    # @torch.no_grad()
+    # def make_decoder_weights_and_grad_unit_norm(self):
+    #     W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
+    #     W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(
+    #         -1, keepdim=True
+    #     ) * W_dec_normed
+    #     self.W_dec.grad -= W_dec_grad_proj
+    #     # Bugfix(?) for ensuring W_dec retains unit norm, this was not there when I trained my original autoencoders.
+    #     self.W_dec.data = W_dec_normed
+
+    def create_save_dir(self):
+        base_dir = Path("/workspace/SAE-Alternatives-2/checkpoints")
         version_list = [
             int(file.name.split(".")[0])
             for file in list(SAVE_DIR.iterdir())
             if "pt" in str(file)
         ]
         if len(version_list):
-            return 1 + max(version_list)
+            version = 1 + max(version_list)
         else:
-            return 0
+            version = 0
+        self.save_dir = base_dir / f"version_{version}"
+        self.save_dir.mkdir(parents=True)
 
     def save(self):
-        version = self.get_version()
-        torch.save(self.state_dict(), SAVE_DIR / (str(version) + ".pt"))
-        with open(SAVE_DIR / (str(version) + "_cfg.json"), "w") as f:
+        if self.save_dir is None:
+            self.create_save_dir()
+        weight_path = self.save_dir / f"{self.save_version}.pt"
+        cfg_path = self.save_dir / f"{self.save_version}_cfg.json"
+
+        torch.save(self.state_dict(), weight_path)
+        with open(cfg_path, "w") as f:
             json.dump(cfg, f)
-        print("Saved as version", version)
+
+        print(f"Saved as version {self.save_version} in {self.save_dir}")
+        self.save_version += 1
 
     @classmethod
-    def load(cls, version):
-        cfg = json.load(open(SAVE_DIR / (str(version) + "_cfg.json"), "r"))
+    def load(cls, version_dir, checkpoint_version, model=None):
+        save_dir = Path("/workspace/SAE-Alternatives-2/checkpoints") / str(version_dir)
+        cfg_path = save_dir / f"{str(checkpoint_version)}_cfg.json"
+        weight_path = save_dir / f"{str(checkpoint_version)}.pt"
+
+        cfg = json.load(open(cfg_path, "r"))
         pprint.pprint(cfg)
-        self = cls(cfg=cfg)
-        self.load_state_dict(torch.load(SAVE_DIR / (str(version) + ".pt")))
+        if model is None:
+            model = (
+                HookedTransformer.from_pretrained(cfg["model_name"])
+                .to(DTYPES[cfg["enc_dtype"]])
+                .to(cfg["device"])
+            )
+        self = cls(cfg=cfg, model=model)
+        self.load_state_dict(torch.load(weight_path))
         return self
 
     # @classmethod
@@ -233,7 +309,7 @@ class AutoEncoder(nn.Module):
 
 # %%
 def shuffle_data(all_tokens):
-    print("Shuffled data")
+    print("Shuffling data")
     return all_tokens[torch.randperm(all_tokens.shape[0])]
 
 
@@ -258,9 +334,9 @@ if loading_data_first_time:
     torch.save(all_tokens_reshaped, "/workspace/data/c4_code_2b_tokens_reshaped.pt")
 else:
     # data = datasets.load_from_disk("/workspace/data/c4_code_tokenized_2b.hf")
-    all_tokens = torch.load("/workspace/data/owt.pt")
-    all_tokens = all_tokens[: 2**20]
-    all_tokens = shuffle_data(all_tokens)
+    all_tokens = torch.load("/workspace/data/owt_tensor.pt")
+    # all_tokens = all_tokens[: cfg["num_tokens"] // cfg["seq_len"]]
+    # all_tokens = shuffle_data(all_tokens)
 
 
 # %%
@@ -279,18 +355,20 @@ class Buffer:
         self.model = model
         self.token_pointer = 0
         self.first = True
+        self.normalize = True
         self.refresh()
 
     @torch.no_grad()
     def refresh(self):
         self.pointer = 0
+        print("Refreshing the buffer!")
         with torch.autocast("cuda", torch.bfloat16):
             if self.first:
                 num_batches = self.cfg["buffer_batches"]
             else:
                 num_batches = self.cfg["buffer_batches"] // 2
             self.first = False
-            for _ in range(0, num_batches, self.cfg["model_batch_size"]):
+            for _ in tqdm.trange(0, num_batches, self.cfg["model_batch_size"]):
                 tokens = all_tokens[
                     self.token_pointer : min(
                         self.token_pointer + self.cfg["model_batch_size"], num_batches
@@ -322,11 +400,90 @@ class Buffer:
     @torch.no_grad()
     def next(self):
         out = self.buffer[self.pointer : self.pointer + self.cfg["batch_size"]]
+        # out: [batch_size, n_layers, d_model]
         self.pointer += self.cfg["batch_size"]
         if self.pointer > self.buffer.shape[0] // 2 - self.cfg["batch_size"]:
             # print("Refreshing the buffer!")
             self.refresh()
+        if self.normalize:
+            # Make each layer's vector have expected norm sqrt(d_model). 
+            # Anthropic average across a dataset, I'll cheaply approximate this with an average norm across a dataset.
+            out = out / out.norm(dim=-1, keepdim=True).mean(0, keepdim=True) * np.sqrt(self.model.cfg.d_model)
         return out
+
+
+class Trainer:
+    def __init__(self, cfg, model):
+        self.cfg = cfg
+        self.model = model
+        self.crosscoder = CrossCoder(cfg, model)
+        self.buffer = Buffer(cfg, model)
+        self.total_steps = cfg["num_tokens"] // cfg["batch_size"]
+
+        self.optimizer = torch.optim.Adam(
+            self.crosscoder.parameters(),
+            lr=cfg["lr"],
+            betas=(cfg["beta1"], cfg["beta2"]),
+        )
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, self.lr_lambda
+        )
+        self.step_counter = 0
+
+        wandb.init(project="crosscoder", entity="neelnanda-io")
+
+    def lr_lambda(self, step):
+        if step < 0.8 * self.total_steps:
+            return 1.0
+        else:
+            return 1.0 - (step - 0.8 * self.total_steps) / (0.2 * self.total_steps)
+
+    def get_l1_coeff(self):
+        # Linearly increases from 0 to cfg["l1_coeff"] over the first 0.05 * self.total_steps steps, then keeps it constant
+        if self.step_counter < 0.05 * self.total_steps:
+            return self.cfg["l1_coeff"] * self.step_counter / (0.05 * self.total_steps)
+        else:
+            return self.cfg["l1_coeff"]
+
+    def step(self):
+        acts = self.buffer.next()
+        losses = self.crosscoder.get_losses(acts)
+        loss = losses.l2_loss + self.get_l1_coeff() * losses.l1_loss
+        loss.backward()
+        clip_grad_norm_(self.crosscoder.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+
+        loss_dict = {
+            "loss": loss.item(),
+            "l2_loss": losses.l2_loss.item(),
+            "l1_loss": losses.l1_loss.item(),
+            "l0_loss": losses.l0_loss.item(),
+            "l1_coeff": self.get_l1_coeff(),
+            "lr": self.scheduler.get_last_lr()[0],
+        }
+        self.step_counter += 1
+        return loss_dict
+
+    def log(self, loss_dict):
+        wandb.log(loss_dict)
+        print(loss_dict)
+
+    def save(self):
+        self.crosscoder.save()
+
+    def train(self):
+        self.step_counter = 0
+        try:
+            for i in tqdm.trange(self.total_steps):
+                loss_dict = self.step()
+                if i % self.cfg["log_every"] == 0:
+                    self.log(loss_dict)
+                if (i + 1) % self.cfg["save_every"] == 0:
+                    self.save()
+        finally:
+            self.save()
 
 
 # buffer.refresh()
