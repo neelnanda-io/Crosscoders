@@ -46,7 +46,7 @@ default_cfg = {
     "seed": 49,
     "batch_size": 2048,
     "buffer_mult": 512,
-    "lr": 5e-5,
+    "lr": 2e-5,
     "num_tokens": 2**30,
     "l1_coeff": 5,
     "beta1": 0.9,
@@ -60,7 +60,7 @@ default_cfg = {
     # "layer": 0,
     "device": "cuda:0",
     "model_batch_size": 32,
-    "log_every": 30,
+    "log_every": 100,
     "save_every": 30000,
     "dec_init_norm": 0.005,
 }
@@ -77,8 +77,6 @@ cfg = arg_parse_update_cfg(default_cfg)
 
 
 def post_init_cfg(cfg):
-    cfg["buffer_size"] = cfg["batch_size"] * cfg["buffer_mult"]
-    cfg["buffer_batches"] = cfg["buffer_size"] // cfg["seq_len"]
     # cfg["act_name"] = utils.get_act_name(cfg["site"], cfg["layer"])
     # cfg["act_size"] = site_to_size[cfg["site"]]
     # cfg["dict_size"] = cfg["act_size"] * cfg["dict_mult"]
@@ -240,9 +238,9 @@ class CrossCoder(nn.Module):
     def create_save_dir(self):
         base_dir = Path("/workspace/SAE-Alternatives-2/checkpoints")
         version_list = [
-            int(file.name.split(".")[0])
+            int(file.name.split("_")[1])
             for file in list(SAVE_DIR.iterdir())
-            if "pt" in str(file)
+            if "version" in str(file)
         ]
         if len(version_list):
             version = 1 + max(version_list)
@@ -346,8 +344,12 @@ class Buffer:
     """
 
     def __init__(self, cfg, model):
+        self.cfg = cfg
+        self.buffer_size = cfg["batch_size"] * cfg["buffer_mult"]
+        self.buffer_batches = self.buffer_size // (cfg["seq_len"] - 1)
+        self.buffer_size = self.buffer_batches * (cfg["seq_len"] - 1)
         self.buffer = torch.zeros(
-            (cfg["buffer_size"], model.cfg.n_layers, model.cfg.d_model),
+            (self.buffer_size, model.cfg.n_layers, model.cfg.d_model),
             dtype=torch.bfloat16,
             requires_grad=False,
         ).to(cfg["device"])
@@ -364,9 +366,9 @@ class Buffer:
         print("Refreshing the buffer!")
         with torch.autocast("cuda", torch.bfloat16):
             if self.first:
-                num_batches = self.cfg["buffer_batches"]
+                num_batches = self.buffer_batches
             else:
-                num_batches = self.cfg["buffer_batches"] // 2
+                num_batches = self.buffer_batches // 2
             self.first = False
             for _ in tqdm.trange(0, num_batches, self.cfg["model_batch_size"]):
                 tokens = all_tokens[
@@ -380,6 +382,7 @@ class Buffer:
                 cache: ActivationCache
 
                 acts = cache.stack_activation("resid_post")
+                acts = acts[:, :, 1:, :] # Drop BOS
                 acts = einops.rearrange(
                     acts,
                     "n_layers batch seq_len d_model -> (batch seq_len) n_layers d_model",
@@ -406,7 +409,7 @@ class Buffer:
             # print("Refreshing the buffer!")
             self.refresh()
         if self.normalize:
-            # Make each layer's vector have expected norm sqrt(d_model). 
+            # Make each layer's vector have expected norm sqrt(d_model).
             # Anthropic average across a dataset, I'll cheaply approximate this with an average norm across a dataset.
             out = out / out.norm(dim=-1, keepdim=True).mean(0, keepdim=True) * np.sqrt(self.model.cfg.d_model)
         return out
@@ -467,7 +470,7 @@ class Trainer:
         return loss_dict
 
     def log(self, loss_dict):
-        wandb.log(loss_dict)
+        wandb.log(loss_dict, step=self.step_counter)
         print(loss_dict)
 
     def save(self):

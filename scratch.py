@@ -7,7 +7,7 @@ scratch_cfg = {
     "dec_init_norm": 0.01,
     "log_every": 5,
     "seed": 50,
-    "num_tokens": 1e7,
+    "num_tokens": int(1e7),
 }
 cfg.update(scratch_cfg)
 train = Trainer(cfg, model)
