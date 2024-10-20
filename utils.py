@@ -43,15 +43,15 @@ def arg_parse_update_cfg(default_cfg):
 
 
 default_cfg = {
-    "seed": 49,
+    "seed": 51,
     "batch_size": 2048,
     "buffer_mult": 512,
     "lr": 2e-5,
-    "num_tokens": 2**30,
-    "l1_coeff": 5,
+    "num_tokens": int(4e8),
+    "l1_coeff": 2,
     "beta1": 0.9,
     "beta2": 0.999,
-    "dict_size": 2**14,
+    "dict_size": 2**16,
     "seq_len": 1024,
     "enc_dtype": "fp32",
     # "remove_rare_dir": False,
@@ -61,7 +61,7 @@ default_cfg = {
     "device": "cuda:0",
     "model_batch_size": 32,
     "log_every": 100,
-    "save_every": 30000,
+    "save_every": 100000,
     "dec_init_norm": 0.005,
 }
 
@@ -358,6 +358,43 @@ class Buffer:
         self.token_pointer = 0
         self.first = True
         self.normalize = True
+        # stdev of residuals per layer / sqrt(d_model)
+        # We divide by this to normalise the data
+        self.normalisation_factor = torch.tensor(
+            [
+                1.8281,
+                2.0781,
+                2.2031,
+                2.4062,
+                2.5781,
+                2.8281,
+                3.1562,
+                3.6875,
+                4.3125,
+                5.4062,
+                7.8750,
+                16.5000,
+            ],
+            device="cuda:0",
+            dtype=torch.float32,
+        )
+        # self.normalisation_factor = torch.tensor(
+        #     [
+        #         1.4248,
+        #         1.5720,
+        #         1.6795,
+        #         1.8498,
+        #         2.0202,
+        #         2.2450,
+        #         2.5181,
+        #         2.9152,
+        #         3.3975,
+        #         4.1135,
+        #         5.1676,
+        #         8.3306,
+        #     ],
+        #     device=cfg["device"],
+        # )
         self.refresh()
 
     @torch.no_grad()
@@ -402,21 +439,21 @@ class Buffer:
 
     @torch.no_grad()
     def next(self):
-        out = self.buffer[self.pointer : self.pointer + self.cfg["batch_size"]]
+        out = self.buffer[self.pointer : self.pointer + self.cfg["batch_size"]].float()
         # out: [batch_size, n_layers, d_model]
         self.pointer += self.cfg["batch_size"]
         if self.pointer > self.buffer.shape[0] // 2 - self.cfg["batch_size"]:
             # print("Refreshing the buffer!")
             self.refresh()
         if self.normalize:
-            # Make each layer's vector have expected norm sqrt(d_model).
-            # Anthropic average across a dataset, I'll cheaply approximate this with an average norm across a dataset.
-            out = out / out.norm(dim=-1, keepdim=True).mean(0, keepdim=True) * np.sqrt(self.model.cfg.d_model)
+            # Make each layer's vector have expected stdev sqrt(d_model).
+            # I use stdev not norm because the mean is easy to learn.
+            out = out / self.normalisation_factor[None, :, None]
         return out
 
 
 class Trainer:
-    def __init__(self, cfg, model):
+    def __init__(self, cfg, model, use_wandb=True):
         self.cfg = cfg
         self.model = model
         self.crosscoder = CrossCoder(cfg, model)
@@ -433,10 +470,13 @@ class Trainer:
         )
         self.step_counter = 0
 
-        wandb.init(project="crosscoder", entity="neelnanda-io")
+        if use_wandb:
+            wandb.init(project="crosscoder", entity="neelnanda-io", config=cfg)
 
     def lr_lambda(self, step):
-        if step < 0.8 * self.total_steps:
+        if step < 0.05 * self.total_steps:
+            return step / (0.05 * self.total_steps)
+        elif step < 0.8 * self.total_steps:
             return 1.0
         else:
             return 1.0 - (step - 0.8 * self.total_steps) / (0.2 * self.total_steps)
