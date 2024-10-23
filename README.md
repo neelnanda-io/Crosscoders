@@ -1,16 +1,16 @@
 Code to train a GPT-2 Small acausal crosscoder
 
 Details (written in the context of someone training a model diff crosscoder):
-I based this on my initial replication of Towards Monosemanticity, not any of the SAE libraries (seemed clunkier to adapt those). Not sure this was the right call
-Key files: utils.py has basically everything important, train.py is a tiny file that calls and runs the trainer, and calling it with eg --l1_coeff=2 will update the config used, scratch.py has some analysis code. Ignore all other files as irrelevant
-I decided to implement it with W_enc having shape [n_layers, d_model, d_sae] and W_dec having shape [d_sae, n_layers, d_model] (here you'd change n_layers to two). It'd also be reasonable to implement it by flattening it into a n_layers * d_model axis and just having a funkier loss function that needs to unflatten, but this felt more elegant to me
-I followed the Anthropic April update method and some adaptions from the crosscoder post like the loss function
-I separately computed and hard coded the normalisation factors, I think these are fairly important. Probably less so here since base and chat should have v similar norms(?)
-This is using ReLU and L1 - I expect topK or JumpReLU would just be better (no shrinkage or "needing to have small activations" issues) and basically work fine, though Anthropic did say something about the weird loss (sum of L2 norm of each layer) incentivising layer sparsity, which may be lost with those? It's probably fine to stick with it as is. Gated with their L1 loss variant may also be fine, idk.
-There's a buffer which runs the model on several batches periodically and stores a shuffled mix of activations and provides them. You'll need to adapt this to run both chat and base (ideally have the same control tokens in both so it's perfectly matched, unless this breaks the base model?)
-I store a pre-tokenized dataset locally and just load it as a global tensor called all_tokens. This is very hacky, but should be easy to swap out
-I found that it was very sensitive to the W_dec init norm - I initially made each d_model vector 0.1 and this went terribly. I think the norm of the flattened vector should probably be 0.1? I just fiddled a bit and found something kinda fine
-Probably not relevant to you, but I found that the crosscoder was much better on earlier layers than later (eg 35% FVU on layer 10, <10% on the first few layers)
+* I based this on my initial replication of Towards Monosemanticity, not any of the SAE libraries (seemed clunkier to adapt those). Not sure this was the right call
+* Key files: utils.py has basically everything important, train.py is a tiny file that calls and runs the trainer, and calling it with eg --l1_coeff=2 will update the config used, scratch.py has some analysis code. Ignore all other files as irrelevant
+* I decided to implement it with W_enc having shape [n_layers, d_model, d_sae] and W_dec having shape [d_sae, n_layers, d_model] (here you'd change n_layers to two). It'd also be reasonable to implement it by flattening it into a n_layers * d_model axis and just having a funkier loss function that needs to unflatten, but this felt more elegant to me
+* I followed the Anthropic April update method and some adaptions from the crosscoder post like the loss function
+* I separately computed and hard coded the normalisation factors, I think these are fairly important. Probably less so here since base and chat should have v similar norms(?)
+* This is using ReLU and L1 - I expect topK or JumpReLU would just be better (no shrinkage or "needing to have small activations" issues) and basically work fine, though Anthropic did say something about the weird loss (sum of L2 norm of each layer) incentivising layer sparsity, which may be lost with those? It's probably fine to stick with it as is. Gated with their L1 loss variant may also be fine, idk.
+* There's a buffer which runs the model on several batches periodically and stores a shuffled mix of activations and provides them. You'll need to adapt this to run both chat and base (ideally have the same control tokens in both so it's perfectly matched, unless this breaks the base model?)
+* I store a pre-tokenized dataset locally and just load it as a global tensor called all_tokens. This is very hacky, but should be easy to swap out
+* I found that it was very sensitive to the W_dec init norm - I initially made each d_model vector 0.1 and this went terribly. I think the norm of the flattened vector should probably be 0.1? I just fiddled a bit and found something kinda fine
+* Probably not relevant to you, but I found that the crosscoder was much better on earlier layers than later (eg 35% FVU on layer 10, <10% on the first few layers)
 
 -----
 # This is all old stuff that's probably no longer relevant
