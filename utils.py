@@ -8,6 +8,8 @@ from neel.imports import *
 from neel_plotly import *
 import wandb
 from torch.nn.utils import clip_grad_norm_
+import huggingface_hub
+
 # %%
 import argparse
 
@@ -65,21 +67,10 @@ default_cfg = {
     "dec_init_norm": 0.005,
 }
 
-# site_to_size = {
-#     "mlp_out": 512,
-#     "post": 2048,
-#     "resid_pre": 512,
-#     "resid_mid": 512,
-#     "resid_post": 512,
-# }
-
 cfg = arg_parse_update_cfg(default_cfg)
 
 
 def post_init_cfg(cfg):
-    # cfg["act_name"] = utils.get_act_name(cfg["site"], cfg["layer"])
-    # cfg["act_size"] = site_to_size[cfg["site"]]
-    # cfg["dict_size"] = cfg["act_size"] * cfg["dict_mult"]
     cfg["name"] = f"{cfg['model_name']}_{cfg['dict_size']}_{cfg['site']}"
 
 
@@ -94,56 +85,43 @@ np.random.seed(SEED)
 random.seed(SEED)
 torch.set_grad_enabled(True)
 
-model: HookedTransformer = (
-    HookedTransformer.from_pretrained(cfg["model_name"])
-    .to(DTYPES[cfg["enc_dtype"]])
-    .to(cfg["device"])
-)
+# model: HookedTransformer = (
+#     HookedTransformer.from_pretrained(cfg["model_name"])
+#     .to(DTYPES[cfg["enc_dtype"]])
+#     .to(cfg["device"])
+# )
 
-n_layers = model.cfg.n_layers
-d_model = model.cfg.d_model
-n_heads = model.cfg.n_heads
-d_head = model.cfg.d_head
-d_mlp = model.cfg.d_mlp
-d_vocab = model.cfg.d_vocab
-
+# n_layers = model.cfg.n_layers
+# d_model = model.cfg.d_model
+# n_heads = model.cfg.n_heads
+# d_head = model.cfg.d_head
+# d_mlp = model.cfg.d_mlp
+# d_vocab = model.cfg.d_vocab
 
 # %%
-# @torch.no_grad()
-# def get_acts(tokens, batch_size=1024):
-#     _, cache = model.run_with_cache(
-#         tokens, stop_at_layer=cfg["layer"] + 1, names_filter=cfg["act_name"]
-#     )
-#     acts = cache[cfg["act_name"]]
-#     acts = acts.reshape(-1, acts.shape[-1])
-#     subsample = torch.randperm(acts.shape[0], generator=GENERATOR)[:batch_size]
-#     subsampled_acts = acts[subsample, :]
-#     return subsampled_acts, acts
-
-
-# sub, acts = get_acts(torch.arange(20).reshape(2, 10), batch_size=3)
-# sub.shape, acts.shape
-# %%
-SAVE_DIR = Path("/workspace/SAE-Alternatives-2/checkpoints")
+# Replace with your own path
+SAVE_DIR = Path("/workspace/Crosscoders/checkpoints")
 
 from typing import NamedTuple
 
+
 class LossOutput(NamedTuple):
-    # loss: torch.Tensor
     l2_loss: torch.Tensor
     l1_loss: torch.Tensor
     l0_loss: torch.Tensor
+
 
 class CrossCoder(nn.Module):
     def __init__(self, cfg, model):
         super().__init__()
         self.cfg = cfg
         d_hidden = self.cfg["dict_size"]
-        # l1_coeff = self.cfg["l1_coeff"]
         self.dtype = DTYPES[self.cfg["enc_dtype"]]
         torch.manual_seed(self.cfg["seed"])
         self.W_enc = nn.Parameter(
-            torch.empty(model.cfg.n_layers, model.cfg.d_model, d_hidden, dtype=self.dtype)
+            torch.empty(
+                model.cfg.n_layers, model.cfg.d_model, d_hidden, dtype=self.dtype
+            )
         )
         self.W_dec = nn.Parameter(
             torch.nn.init.normal_(
@@ -154,7 +132,9 @@ class CrossCoder(nn.Module):
         )
         # Make norm of W_dec 0.1 for each column, separate per layer
         self.W_dec.data = (
-            self.W_dec.data / self.W_dec.data.norm(dim=-1, keepdim=True) * self.cfg["dec_init_norm"]
+            self.W_dec.data
+            / self.W_dec.data.norm(dim=-1, keepdim=True)
+            * self.cfg["dec_init_norm"]
         )
         # Initialise W_enc to be the transpose of W_dec
         self.W_enc.data = einops.rearrange(
@@ -166,10 +146,7 @@ class CrossCoder(nn.Module):
             torch.zeros((model.cfg.n_layers, model.cfg.d_model), dtype=self.dtype)
         )
 
-        # self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
-
         self.d_hidden = d_hidden
-        # self.l1_coeff = l1_coeff
 
         self.to(self.cfg["device"])
 
@@ -181,7 +158,7 @@ class CrossCoder(nn.Module):
         x_enc = einops.einsum(
             x,
             self.W_enc,
-            "batch n_layers d_model, n_layers d_model d_hidden -> batch d_hidden",
+            "... n_layers d_model, n_layers d_model d_hidden -> ... d_hidden",
         )
         if apply_relu:
             acts = F.relu(x_enc + self.b_enc)
@@ -194,7 +171,7 @@ class CrossCoder(nn.Module):
         acts_dec = einops.einsum(
             acts,
             self.W_dec,
-            "batch d_hidden, d_hidden n_layers d_model -> batch n_layers d_model",
+            "... d_hidden, d_hidden n_layers d_model -> ... n_layers d_model",
         )
         return acts_dec + self.b_dec
 
@@ -211,32 +188,21 @@ class CrossCoder(nn.Module):
         x_reconstruct = self.decode(acts)
         diff = x_reconstruct.float() - x.float()
         squared_diff = diff.pow(2)
-        l2_per_batch = einops.reduce(squared_diff, 'batch n_layers d_model -> batch', 'sum')
+        l2_per_batch = einops.reduce(squared_diff, "... n_layers d_model -> ...", "sum")
         l2_loss = l2_per_batch.mean()
 
         decoder_norms = self.W_dec.norm(dim=-1)
         # decoder_norms: [d_hidden, n_layers]
-        total_decoder_norm = einops.reduce(decoder_norms, 'd_hidden n_layers -> d_hidden', 'sum')
+        total_decoder_norm = einops.reduce(
+            decoder_norms, "d_hidden n_layers -> d_hidden", "sum"
+        )
         l1_loss = (acts * total_decoder_norm[None, :]).sum(-1).mean(0)
 
-        # overall_loss = l2_loss + self.l1_coeff *  l1_loss
-
-        l0_loss = (acts>0).float().sum(-1).mean()
+        l0_loss = (acts > 0).float().sum(-1).mean()
 
         return LossOutput(l2_loss=l2_loss, l1_loss=l1_loss, l0_loss=l0_loss)
 
-    # @torch.no_grad()
-    # def make_decoder_weights_and_grad_unit_norm(self):
-    #     W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
-    #     W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(
-    #         -1, keepdim=True
-    #     ) * W_dec_normed
-    #     self.W_dec.grad -= W_dec_grad_proj
-    #     # Bugfix(?) for ensuring W_dec retains unit norm, this was not there when I trained my original autoencoders.
-    #     self.W_dec.data = W_dec_normed
-
     def create_save_dir(self):
-        base_dir = Path("/workspace/SAE-Alternatives-2/checkpoints")
         version_list = [
             int(file.name.split("_")[1])
             for file in list(SAVE_DIR.iterdir())
@@ -246,7 +212,7 @@ class CrossCoder(nn.Module):
             version = 1 + max(version_list)
         else:
             version = 0
-        self.save_dir = base_dir / f"version_{version}"
+        self.save_dir = SAVE_DIR / f"version_{version}"
         self.save_dir.mkdir(parents=True)
 
     def save(self):
@@ -263,10 +229,20 @@ class CrossCoder(nn.Module):
         self.save_version += 1
 
     @classmethod
-    def load(cls, version_dir, checkpoint_version, model=None):
-        save_dir = Path("/workspace/SAE-Alternatives-2/checkpoints") / str(version_dir)
-        cfg_path = save_dir / f"{str(checkpoint_version)}_cfg.json"
-        weight_path = save_dir / f"{str(checkpoint_version)}.pt"
+    def load(
+        cls,
+        name,
+        model=None,
+        path="",
+    ):
+        # If the files are not in the default save directory, you can specify a path
+        # It's assumed that weights are [name].pt and cfg is [name]_cfg.json
+        if path == "":
+            save_dir = SAVE_DIR
+        else:
+            save_dir = Path(path)
+        cfg_path = save_dir / f"{str(name)}_cfg.json"
+        weight_path = save_dir / f"{str(name)}.pt"
 
         cfg = json.load(open(cfg_path, "r"))
         pprint.pprint(cfg)
@@ -280,29 +256,54 @@ class CrossCoder(nn.Module):
         self.load_state_dict(torch.load(weight_path))
         return self
 
-    # @classmethod
-    # def load_from_hf(cls, version):
-    #     """
-    #     Loads the saved autoencoder from HuggingFace.
+    @classmethod
+    def load_from_hf(cls, version):
+        """
+        Loads the saved autoencoder from HuggingFace.
 
-    #     Version is expected to be an int, or "run1" or "run2"
+        Version is expected to be an int, or "run1" or "run2"
 
-    #     version 25 is the final checkpoint of the first autoencoder run,
-    #     version 47 is the final checkpoint of the second autoencoder run.
-    #     """
-    #     if version=="run1":
-    #         version = 25
-    #     elif version=="run2":
-    #         version = 47
+        version 25 is the final checkpoint of the first autoencoder run,
+        version 47 is the final checkpoint of the second autoencoder run.
+        """
+        if version == "run1":
+            version = 25
+        elif version == "run2":
+            version = 47
 
-    #     cfg = utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}_cfg.json")
-    #     pprint.pprint(cfg)
-    #     self = cls(cfg=cfg)
-    #     self.load_state_dict(utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True))
-    #     return self
+        cfg = utils.download_file_from_hf(
+            "NeelNanda/sparse_autoencoder", f"{version}_cfg.json"
+        )
+        pprint.pprint(cfg)
+        self = cls(cfg=cfg)
+        self.load_state_dict(
+            utils.download_file_from_hf(
+                "NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True
+            )
+        )
+        return self
 
 
 # %%
+def get_stacked_resids(model, tokens, drop_bos=True):
+    """
+    Returns the stacked activations of the resid_post hook for all layers.
+
+    This could be made about 2x more memory efficient with a buffer, but who cares.
+
+    If drop_bos is true, the resids on the BOS (first) token is dropped.
+
+    Returns stacked_resids: [batch, seq_len (- 1), n_layers, d_model]
+    """
+    _, cache = model.run_with_cache(
+        tokens, names_filter=lambda x: x.endswith("resid_post")
+    )
+    stacked_resids = torch.stack(
+        [cache["resid_post", i] for i in range(model.cfg.n_layers)], dim=-2
+    )
+    if drop_bos:
+        stacked_resids = stacked_resids[:, 1:, :, :]
+    return stacked_resids
 
 
 # %%
@@ -311,30 +312,56 @@ def shuffle_data(all_tokens):
     return all_tokens[torch.randperm(all_tokens.shape[0])]
 
 
-loading_data_first_time = False
-if loading_data_first_time:
-    raise NotImplementedError("This is not implemented yet")
-    data = load_dataset(
-        "NeelNanda/c4-code-tokenized-2b", split="train", cache_dir="/workspace/cache/"
-    )
-    data.save_to_disk("/workspace/data/c4_code_tokenized_2b.hf")
-    data.set_format(type="torch", columns=["tokens"])
-    all_tokens = data["tokens"]
-    all_tokens.shape
+def push_to_hub(local_dir):
+    if isinstance(local_dir, huggingface_hub.Repository):
+        local_dir = local_dir.local_dir
+    os.system(f"git -C {local_dir} add .")
+    os.system(f"git -C {local_dir} commit -m 'Auto Commit'")
+    os.system(f"git -C {local_dir} push")
 
-    all_tokens_reshaped = einops.rearrange(
-        all_tokens, "batch (x seq_len) -> (batch x) seq_len", x=8, seq_len=128
-    )
-    all_tokens_reshaped[:, 0] = model.tokenizer.bos_token_id
-    all_tokens_reshaped = all_tokens_reshaped[
-        torch.randperm(all_tokens_reshaped.shape[0])
-    ]
-    torch.save(all_tokens_reshaped, "/workspace/data/c4_code_2b_tokens_reshaped.pt")
-else:
-    # data = datasets.load_from_disk("/workspace/data/c4_code_tokenized_2b.hf")
-    all_tokens = torch.load("/workspace/data/owt_tensor.pt")
-    # all_tokens = all_tokens[: cfg["num_tokens"] // cfg["seq_len"]]
-    # all_tokens = shuffle_data(all_tokens)
+
+def upload_folder_to_hf(folder_path, repo_name=None, debug=False):
+    """
+    Uploads a folder to HuggingFace, and creates a repo for it.
+    """
+    folder_path = Path(folder_path)
+    if repo_name is None:
+        repo_name = folder_path.name
+    repo_folder = folder_path.parent / (folder_path.name + "_repo")
+    repo_url = huggingface_hub.create_repo(repo_name, exist_ok=True)
+    repo = huggingface_hub.Repository(repo_folder, repo_url)
+
+    for file in folder_path.iterdir():
+        if debug:
+            print(file.name)
+        file.rename(repo_folder / file.name)
+    push_to_hub(repo.local_dir)
+
+
+# loading_data_first_time = False
+# if loading_data_first_time:
+#     raise NotImplementedError("This is not implemented yet")
+#     data = load_dataset(
+#         "NeelNanda/c4-code-tokenized-2b", split="train", cache_dir="/workspace/cache/"
+#     )
+#     data.save_to_disk("/workspace/data/c4_code_tokenized_2b.hf")
+#     data.set_format(type="torch", columns=["tokens"])
+#     all_tokens = data["tokens"]
+#     all_tokens.shape
+
+#     all_tokens_reshaped = einops.rearrange(
+#         all_tokens, "batch (x seq_len) -> (batch x) seq_len", x=8, seq_len=128
+#     )
+#     all_tokens_reshaped[:, 0] = model.tokenizer.bos_token_id
+#     all_tokens_reshaped = all_tokens_reshaped[
+#         torch.randperm(all_tokens_reshaped.shape[0])
+#     ]
+#     torch.save(all_tokens_reshaped, "/workspace/data/c4_code_2b_tokens_reshaped.pt")
+# else:
+#     # data = datasets.load_from_disk("/workspace/data/c4_code_tokenized_2b.hf")
+#     all_tokens = torch.load("/workspace/data/owt_tensor.pt")
+#     # all_tokens = all_tokens[: cfg["num_tokens"] // cfg["seq_len"]]
+#     # all_tokens = shuffle_data(all_tokens)
 
 
 # %%
@@ -358,8 +385,8 @@ class Buffer:
         self.token_pointer = 0
         self.first = True
         self.normalize = True
-        # stdev of residuals per layer / sqrt(d_model)
-        # We divide by this to normalise the data
+        # average norm of residuals per layer / sqrt(d_model)
+        # We divide by this to normalise the data. This is *not* mean centered.
         self.normalisation_factor = torch.tensor(
             [
                 1.8281,
@@ -378,6 +405,7 @@ class Buffer:
             device="cuda:0",
             dtype=torch.float32,
         )
+        # The factors when mean centering (ie using the standard deviation)
         # self.normalisation_factor = torch.tensor(
         #     [
         #         1.4248,
@@ -419,7 +447,7 @@ class Buffer:
                 cache: ActivationCache
 
                 acts = cache.stack_activation("resid_post")
-                acts = acts[:, :, 1:, :] # Drop BOS
+                acts = acts[:, :, 1:, :]  # Drop BOS
                 acts = einops.rearrange(
                     acts,
                     "n_layers batch seq_len d_model -> (batch seq_len) n_layers d_model",
@@ -549,40 +577,6 @@ def zero_ablate_hook(mlp_post, hook):
     return mlp_post
 
 
-# Needs to be adapted to work with crosscoders, and is kinda cursed
-# @torch.no_grad()
-# def get_recons_loss(num_batches=5, local_encoder=None):
-#     if local_encoder is None:
-#         local_encoder = encoder
-#     loss_list = []
-#     for i in range(num_batches):
-#         tokens = all_tokens[torch.randperm(len(all_tokens))[: cfg["model_batch_size"]]]
-#         loss = model(tokens, return_type="loss")
-#         recons_loss = model.run_with_hooks(
-#             tokens,
-#             return_type="loss",
-#             fwd_hooks=[
-#                 (cfg["act_name"], partial(replacement_hook, encoder=local_encoder))
-#             ],
-#         )
-#         # mean_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], mean_ablate_hook)])
-#         zero_abl_loss = model.run_with_hooks(
-#             tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], zero_ablate_hook)]
-#         )
-#         loss_list.append((loss, recons_loss, zero_abl_loss))
-#     losses = torch.tensor(loss_list)
-#     loss, recons_loss, zero_abl_loss = losses.mean(0).tolist()
-
-#     print(loss, recons_loss, zero_abl_loss)
-#     score = (zero_abl_loss - recons_loss) / (zero_abl_loss - loss)
-#     print(f"{score:.2%}")
-#     # print(f"{((zero_abl_loss - mean_abl_loss)/(zero_abl_loss - loss)).item():.2%}")
-#     return score, loss, recons_loss, zero_abl_loss
-
-
-# print(get_recons_loss())
-
-
 # %%
 # Frequency
 @torch.no_grad()
@@ -611,15 +605,3 @@ def get_freqs(num_batches=25, local_encoder=None):
     num_dead = (act_freq_scores == 0).float().mean()
     print("Num dead", num_dead)
     return act_freq_scores
-
-
-# %%
-# @torch.no_grad()
-# def re_init(indices, encoder):
-#     new_W_enc = torch.nn.init.kaiming_uniform_(torch.zeros_like(encoder.W_enc))
-#     new_W_dec = torch.nn.init.kaiming_uniform_(torch.zeros_like(encoder.W_dec))
-#     new_b_enc = torch.zeros_like(encoder.b_enc)
-#     print(new_W_dec.shape, new_W_enc.shape, new_b_enc.shape)
-#     encoder.W_enc.data[:, indices] = new_W_enc[:, indices]
-#     encoder.W_dec.data[indices, :] = new_W_dec[indices, :]
-#     encoder.b_enc.data[indices] = new_b_enc[indices]
