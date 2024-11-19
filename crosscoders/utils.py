@@ -1,11 +1,28 @@
 # %%
 import os
 
-os.environ["TRANSFORMERS_CACHE"] = "/workspace/cache/"
-os.environ["DATASETS_CACHE"] = "/workspace/cache/"
+# os.environ["TRANSFORMERS_CACHE"] = "/workspace/cache/"
+# os.environ["DATASETS_CACHE"] = "/workspace/cache/"
 # %%
-from neel.imports import *
-from neel_plotly import *
+import os
+import json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import random
+import tqdm
+import pprint
+import einops
+import wandb
+from pathlib import Path
+from torch.nn.utils import clip_grad_norm_
+import huggingface_hub
+import argparse
+from typing import NamedTuple
+from datasets import load_dataset
+from transformer_lens import HookedTransformer, ActivationCache
+from IPython import get_ipython
 import wandb
 from torch.nn.utils import clip_grad_norm_
 import huggingface_hub
